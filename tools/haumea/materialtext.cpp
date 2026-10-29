@@ -741,8 +741,10 @@ RescanMaterialFonts(void)
  * Rendering
  */
 
-// DrawTextA interprets the bytes in the ANSI code page (1252 on the Western
-// systems SA-MP scripts are written for).
+// The editor stores material text as UTF-8, so the preview renders the code
+// points the author typed. Stray bytes that aren't valid UTF-8 still fall
+// back to Windows-1252, as DrawTextA would on the Western systems SA-MP
+// scripts are typically written for.
 static uint32
 windows1252ToUnicode(uint8 c)
 {
@@ -757,14 +759,49 @@ windows1252ToUnicode(uint8 c)
 	return c;
 }
 
+// The editor keeps material text as UTF-8: imported scripts are decoded to it
+// and the text field writes it, so preview the code points the author typed.
+// A byte that does not start a well-formed sequence still falls back to
+// Windows-1252, which keeps single-byte text rendering exactly as it did.
+static uint32
+decodeMaterialCodepoint(const char **pp)
+{
+	const unsigned char *p = (const unsigned char*)*pp;
+	unsigned char c = *p;
+	if(c < 0x80){
+		*pp += 1;
+		return c;
+	}
+	int extra;
+	uint32 cp;
+	if((c & 0xE0) == 0xC0){ extra = 1; cp = c & 0x1F; }
+	else if((c & 0xF0) == 0xE0){ extra = 2; cp = c & 0x0F; }
+	else if((c & 0xF8) == 0xF0){ extra = 3; cp = c & 0x07; }
+	else{
+		*pp += 1;
+		return windows1252ToUnicode(c);
+	}
+	for(int i = 1; i <= extra; i++){
+		if((p[i] & 0xC0) != 0x80){
+			// Not UTF-8 after all: a Windows-1252 byte, or a sequence cut
+			// short by the end of the string.
+			*pp += 1;
+			return windows1252ToUnicode(c);
+		}
+		cp = cp << 6 | (p[i] & 0x3F);
+	}
+	*pp += 1 + extra;
+	return cp;
+}
+
 static int
-glyphForByte(LoadedMaterialFont *font, uint8 c)
+glyphForCodepoint(LoadedMaterialFont *font, uint32 cp)
 {
 	if(font->symbol){
-		int glyph = stbtt_FindGlyphIndex(&font->info, 0xF000 + c);
-		return glyph ? glyph : stbtt_FindGlyphIndex(&font->info, c);
+		int glyph = stbtt_FindGlyphIndex(&font->info, 0xF000 + cp);
+		return glyph ? glyph : stbtt_FindGlyphIndex(&font->info, cp);
 	}
-	return stbtt_FindGlyphIndex(&font->info, windows1252ToUnicode(c));
+	return stbtt_FindGlyphIndex(&font->info, cp);
 }
 
 static int
@@ -797,7 +834,7 @@ parseColorTag(const char *p, uint32 *rgb)
 
 struct MaterialTextGlyph
 {
-	uint8 character;
+	uint32 character;	// UTF-8-decoded code point (1252 per stray byte)
 	uint32 color;	// D3DCOLOR (ARGB)
 };
 
@@ -832,7 +869,7 @@ parseMaterialText(const char *text, uint32 baseColor,
 			continue;
 		}
 		MaterialTextGlyph glyph;
-		glyph.character = (uint8)*p++;
+		glyph.character = decodeMaterialCodepoint(&p);
 		glyph.color = color;
 		lines.back().push_back(glyph);
 	}
@@ -905,8 +942,8 @@ RenderMaterialTextImage(const ObjectMaterialOverride &material)
 		std::vector<int> advances(glyphs.size());
 		int lineWidth = 0;
 		for(size_t i = 0; i < glyphs.size(); i++){
-			uint8 c = glyphs[i].character == '\t' ? ' ' : glyphs[i].character;
-			glyphIndices[i] = glyphForByte(font, c);
+			uint32 c = (glyphs[i].character == '\t') ? (uint32)' ' : glyphs[i].character;
+			glyphIndices[i] = glyphForCodepoint(font, c);
 			int advance, lsb;
 			stbtt_GetGlyphHMetrics(&font->info, glyphIndices[i], &advance, &lsb);
 			advances[i] = (int)floorf(advance*scale + 0.5f) + (syntheticBold ? 1 : 0);
@@ -921,7 +958,7 @@ RenderMaterialTextImage(const ObjectMaterialOverride &material)
 		int baseline = top + (int)line*lineHeight + ascent;
 
 		for(size_t i = 0; i < glyphs.size(); penX += advances[i], i++){
-			uint8 c = glyphs[i].character;
+			uint32 c = glyphs[i].character;
 			if(c == ' ' || c == '\t')
 				continue;
 			int gw, gh, gx, gy;
