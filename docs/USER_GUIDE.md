@@ -297,6 +297,20 @@ The canvas follows the game's rules for the tokens in a textdraw's text:
   - `test~n~~w~test`: a token after `~n~` applies as usual.
 - `~k~~PED_FIREWEAPON~` shows a key name in game; Haumea leaves it out.
 
+### Text in other scripts
+
+The game draws textdraws from its own Latin font, so text in Chinese, Japanese, Korean, Russian
+and the like comes out as arbitrary characters in game unless the client has a font patch for
+that script (wm_sachs, for one). Haumea cannot know whether your players have one, so the canvas
+previews those strings with its own interface font instead: the text, colours, outline and shadow
+are what the game would draw, and the height follows TextDrawLetterSize, but the spacing comes
+from that font rather than the game's, so where a line wraps and how wide the selection box is can
+differ a little.
+
+Only a string with a multibyte UTF-8 sequence takes that path; accented Latin text stays on the
+game's font, which carries it. The interface font has the glyphs while a translation in that
+script is installed, which is what makes Haumea load such a face.
+
 ## Prefabs
 
 A prefab is a group of objects saved to place again. Select the objects and use **File → Export

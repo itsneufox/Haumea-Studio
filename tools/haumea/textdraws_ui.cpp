@@ -503,6 +503,25 @@ readToken(const std::string &s, size_t i, size_t *next)
 	return code;
 }
 
+// How many continuation bytes this one starts, 0 when it is an ASCII byte or a
+// stray one. The game's font knows nothing of UTF-8 and gives every byte a cell
+// of its own, which is why a canvas that draws a character as a character
+// counts it once instead (three cells make a box three times too wide).
+static size_t
+utf8ContinuationBytes(const std::string &s, size_t i)
+{
+	unsigned char lead = (unsigned char)s[i];
+	size_t len = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC2 ? 2 : 1;
+	if(len == 1)
+		return 0;
+	if(i + len > s.size())
+		return 0;
+	for(size_t k = 1; k < len; k++)
+		if(((unsigned char)s[i + k] & 0xC0) != 0x80)
+			return 0;
+	return len - 1;
+}
+
 // SA-MP sets CFont::SetScale(letterX, letterY * 0.5) in 640x448 units
 // (DrawTextDrawRuntimeText, 0x100B31A0): glyphs are 32 * x by 20 * y * 0.5
 // (CFont::PrintChar) and lines 18 * y * 0.5 apart (ProcessCurrentString).
@@ -556,6 +575,8 @@ layoutText(const TextDraw &td, std::vector<Glyph> &glyphs, float *minX, float *m
 			inWord = false;
 			continue;
 		}
+		// A character in another script takes one cell here, not one per byte.
+		size_t extra = utf8ContinuationBytes(s, i);
 		float advance = charAdvance(td, (unsigned char)c);
 		if(c == ' ')
 			inWord = false;
@@ -573,6 +594,7 @@ layoutText(const TextDraw &td, std::vector<Glyph> &glyphs, float *minX, float *m
 					continue;
 				}
 				word += charAdvance(td, (unsigned char)s[k]);
+				k += utf8ContinuationBytes(s, k);
 			}
 			if(wrap > 0.0f && !lines.back().glyphs.empty() && lines.back().width + word > wrap)
 				newLine();
@@ -580,12 +602,14 @@ layoutText(const TextDraw &td, std::vector<Glyph> &glyphs, float *minX, float *m
 		Line *line = &lines.back();
 		Glyph g;
 		g.x = line->width;
-		// '_' is the usual invisible character in textdraws.
-		g.index = c == '_' ? 0 : glyphIndex(td.font, (unsigned char)c);
+		// '_' is the usual invisible character in textdraws, and a character in
+		// another script has no glyph in the game's atlas at all.
+		g.index = extra || c == '_' ? 0 : glyphIndex(td.font, (unsigned char)c);
 		g.colour = rgbaToImU32(colour);
 		g.rgba = colour;
 		line->glyphs.push_back(g);
 		line->width += advance;
+		i += extra;
 	}
 	*minX = 1e9f;
 	*maxX = -1e9f;
@@ -1143,6 +1167,152 @@ drawGlyphs(ImDrawList *dl, const Canvas &cv, const TextDraw &td, const std::vect
 	}
 }
 
+// ---- Text in another script ----
+
+// The game's textdraw atlas holds Latin glyphs only (glyphIndex above), so a
+// string in another script lands on arbitrary cells and every byte takes one
+// cell of its own. Haumea previews those with its own UI font instead:
+// style.cpp merges a face that covers the script, and the atlas loads glyphs on
+// demand at the size it is asked for, so this is sharp at any zoom. It stands
+// in for a client with a CJK font patch (wm_sachs and the like) - the catalog
+// and the map file need no change, the client does. Text the game can draw
+// keeps the faithful path; only a multibyte UTF-8 sequence takes this one.
+static bool
+textInOtherScript(const std::string &s)
+{
+	for(size_t i = 0; i + 1 < s.size(); i++){
+		unsigned char lead = (unsigned char)s[i], next = (unsigned char)s[i + 1];
+		// A lead byte. 0x80..0xBF on its own is a Windows-1252 character,
+		// which the atlas does carry, so that stays on the game's path.
+		if(lead >= 0xC2 && lead <= 0xF4 && (next & 0xC0) == 0x80)
+			return true;
+	}
+	return false;
+}
+
+// CFont's glyphs are 10 * letterY units tall (TD_GLYPH_HEIGHT above); a font's
+// em box is taller than its capitals, so the size is chosen to keep the height
+// close. Only the height is matched: the advance comes from the font, so a
+// string is laid out like the font does it, not like the client does.
+static const float TD_OTHER_SCRIPT_EM = 0.8f;
+
+static void
+drawOtherScriptText(ImDrawList *dl, const Canvas &cv, const TextDraw &td)
+{
+	ImFont *font = ImGui::GetFont();
+	if(font == nil || td.letterY <= 0.0f || cv.sx <= 0.0f || cv.sy <= 0.0f)
+		return;
+	float size = TD_GLYPH_HEIGHT * td.letterY * cv.sy / TD_OTHER_SCRIPT_EM;
+	if(size < 1.0f)
+		size = 1.0f;	// a thumbnail keeps its text, however small it gets
+	// The wrap width as the game reads it (layoutText above), in this canvas's
+	// pixels: only the right and left alignments wrap at TextDrawTextSize.
+	float wrap = (td.alignment == 2 ? td.sizeY : td.alignment == 3 ? td.x - td.sizeX : td.sizeX - td.x) * cv.sx;
+
+	// One item per character, holding its UTF-8 bytes, so a wrap can move a
+	// whole word the way the client moves it.
+	struct Item { std::string utf8; unsigned int colour; };
+	struct Line { std::vector<Item> items; float width; };
+	std::vector<Line> lines(1);
+	lines[0].width = 0.0f;
+	std::vector<Item> word;
+	float wordWidth = 0.0f;
+	unsigned int colour = td.colour;
+	auto measure = [&](const std::string &t){
+		return font->CalcTextSizeA(size, 1e9f, 0.0f, t.c_str()).x;
+	};
+	auto newLine = [&](bool resetColour){
+		// Like ProcessCurrentString, a new line starts in the textdraw's colour
+		// again; a wrap keeps the colour the text is already in.
+		lines.push_back(Line());
+		lines.back().width = 0.0f;
+		if(resetColour)
+			colour = td.colour;
+	};
+	auto flushWord = [&](){
+		if(word.empty())
+			return;
+		if(wrap > 0.0f && !lines.back().items.empty() && lines.back().width + wordWidth > wrap)
+			newLine(false);
+		for(const Item &item : word){
+			lines.back().items.push_back(item);
+			lines.back().width += measure(item.utf8);
+		}
+		word.clear();
+		wordWidth = 0.0f;
+	};
+	const std::string &s = td.text;
+	for(size_t i = 0; i < s.size(); ){
+		char c = s[i];
+		if(c == '~'){
+			size_t next;
+			char code = readToken(s, i, &next);
+			if(code == 'n' || code == 'N'){
+				flushWord();
+				newLine(true);
+			}else
+				applyColourToken(code, &colour);
+			i = next;
+			continue;
+		}
+		if(c == '\n'){
+			flushWord();
+			newLine(true);
+			i++;
+			continue;
+		}
+		// One item for the whole character, so it is never cut in half.
+		size_t len = 1 + utf8ContinuationBytes(s, i);
+		// '_' is the usual invisible character in textdraws.
+		bool blank = c == ' ' || c == '_';
+		Item item;
+		item.utf8 = blank ? " " : s.substr(i, len);
+		item.colour = colour;
+		i += len;
+		if(blank){
+			flushWord();
+			lines.back().items.push_back(item);
+			lines.back().width += measure(item.utf8);
+		}else{
+			word.push_back(item);
+			wordWidth += measure(item.utf8);
+		}
+	}
+	flushWord();
+	while(lines.size() > 1 && lines.back().items.empty())
+		lines.pop_back();
+
+	ImU32 back = rgbaToImU32(td.backgroundColour);
+	float step = lineHeight(td);
+	auto draw = [&](float ox, float oy, ImU32 overrideColour, bool useOverride){
+		for(size_t l = 0; l < lines.size(); l++){
+			float x = td.alignment == 2 ? td.x - lines[l].width * 0.5f / cv.sx :
+				td.alignment == 3 ? td.x - lines[l].width / cv.sx : td.x;
+			float y = td.y + l * step;
+			// A run of one colour goes to the list in one call.
+			for(size_t i = 0; i < lines[l].items.size(); ){
+				unsigned int runColour = lines[l].items[i].colour;
+				std::string run;
+				while(i < lines[l].items.size() && lines[l].items[i].colour == runColour)
+					run += lines[l].items[i++].utf8;
+				dl->AddText(font, size, cv.at(x + ox, y + oy),
+					useOverride ? overrideColour : rgbaToImU32(runColour), run.c_str());
+				x += measure(run) / cv.sx;
+			}
+		}
+	};
+	if(td.outline > 0){
+		// CFont's edge all the way round, as far as the outline is wide.
+		float o = (float)td.outline;
+		for(int k = 0; k < 8; k++){
+			float a = k * 3.14159265f / 4.0f;
+			draw(cosf(a) * o, sinf(a) * o, back, true);
+		}
+	}else if(td.shadow > 0)
+		draw((float)td.shadow, (float)td.shadow, back, true);
+	draw(0.0f, 0.0f, 0, false);
+}
+
 static void
 drawTextDraw(ImDrawList *dl, const Canvas &cv, const TextDraw &td)
 {
@@ -1192,6 +1362,10 @@ drawTextDraw(ImDrawList *dl, const Canvas &cv, const TextDraw &td)
 	}
 	if(td.useBox)
 		dl->AddRectFilled(cv.at(x0, y0), cv.at(x1, y1), rgbaToImU32(td.boxColour));
+	if(textInOtherScript(td.text)){
+		drawOtherScriptText(dl, cv, td);
+		return;
+	}
 	std::vector<Glyph> glyphs;
 	float minX, maxX;
 	int lines;
